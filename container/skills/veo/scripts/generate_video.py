@@ -31,6 +31,7 @@ import mimetypes
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 DEFAULT_DURATION_CAP_SECONDS = 16
@@ -137,6 +138,14 @@ def build_parser() -> argparse.ArgumentParser:
             "if Veo has not completed by this point. Default: %(default)ss."
         ),
     )
+    parser.add_argument(
+        "--request-id",
+        dest="request_id",
+        help=(
+            "Stable identifier for the progress-feedback layer. Must match "
+            "^[A-Za-z0-9_-]+$. Defaults to a uuid4 hex string when omitted."
+        ),
+    )
     return parser
 
 
@@ -199,6 +208,45 @@ def load_image_bytes(path: str) -> tuple[bytes, str]:
     return data, mime
 
 
+class _NoOpProgress:
+    """Stand-in when running outside an agent container (no NANOCLAW_CHAT_JID).
+
+    Lets the producer call p.update/p.done/p.fail unconditionally without
+    branching on whether the progress layer is active.
+    """
+
+    def __enter__(self) -> "_NoOpProgress":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def update(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def done(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def fail(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+def _resolve_progress_context(request_id: str, model_id: str):
+    """Open a progress context when NANOCLAW_CHAT_JID is set, else a no-op.
+
+    The progress layer is mounted at /app/lib/progress.py inside the agent
+    container; outside the container the helper module may be absent.
+    """
+    chat_jid = os.environ.get("NANOCLAW_CHAT_JID")
+    if not chat_jid:
+        return _NoOpProgress()
+    try:
+        from progress import progress  # type: ignore[import-not-found]
+    except ImportError:
+        return _NoOpProgress()
+    return progress("veo", request_id, chat_jid=chat_jid, model_id=model_id)
+
+
 def run(args: argparse.Namespace) -> int:
     api_key = get_api_key(args.api_key)
     if not api_key:
@@ -212,6 +260,11 @@ def run(args: argparse.Namespace) -> int:
     if not ok:
         print(f"Error: {err}", file=sys.stderr)
         return 1
+
+    # Stable per-invocation identifier for the progress layer. uuid4 avoids
+    # the hash-collision race the doc-review flagged: two invocations with
+    # the same prompt and timestamp would otherwise race on rename(tmp,final).
+    request_id = args.request_id or uuid.uuid4().hex
 
     # Import lazily so argparse errors don't pay the SDK import cost.
     from google import genai
@@ -283,54 +336,78 @@ def run(args: argparse.Namespace) -> int:
         call_kwargs["video"] = prior_video
 
     print(f"Submitting Veo generation (model={model}, duration={args.duration}s)...", file=sys.stderr)
-    try:
-        operation = client.models.generate_videos(**call_kwargs)
-    except Exception as exc:  # noqa: BLE001
-        print(f"Error: generate_videos call failed: {exc}", file=sys.stderr)
-        return 1
 
-    op_name = getattr(operation, "name", "<unknown>")
-    print(f"Operation: {op_name}", file=sys.stderr)
-
-    elapsed = 0.0
-    while not getattr(operation, "done", False):
-        if elapsed >= args.max_poll_seconds:
-            print(
-                f"Error: Veo operation did not complete within "
-                f"--max-poll-seconds={args.max_poll_seconds:.0f}s. "
-                f"Operation name '{op_name}' may still be retrievable for up to 2 days; "
-                f"re-run with --extend-from or use a fresh prompt.",
-                file=sys.stderr,
-            )
-            return 1
-        time.sleep(args.poll_interval)
-        elapsed += args.poll_interval
+    # Wrap from operation submission onward in the progress context so the
+    # orchestrator can drive an anchor message through the lifecycle.
+    # `p.done()` only updates the anchor text — the agent's `send_video` MCP
+    # call delivers the actual MP4 bytes (the `MEDIA: <path>` token below is
+    # what the agent reads). This avoids the double-delivery the doc-review
+    # flagged: progress events update the anchor, the existing send_video
+    # path delivers the file.
+    with _resolve_progress_context(request_id, model) as p:
         try:
-            operation = client.operations.get(operation)
+            operation = client.models.generate_videos(**call_kwargs)
         except Exception as exc:  # noqa: BLE001
-            print(f"Error: poll failed at {elapsed:.0f}s: {exc}", file=sys.stderr)
+            print(f"Error: generate_videos call failed: {exc}", file=sys.stderr)
+            p.fail(f"generate_videos call failed: {exc}", last_stage="queued")
             return 1
-        print(f"Polling... ({elapsed:.0f}s elapsed)", file=sys.stderr)
 
-    # Success path: pull the first video, save to --filename.
-    try:
-        video_obj = operation.response.generated_videos[0].video
-    except (AttributeError, IndexError) as exc:
-        print(f"Error: no video in operation response: {exc}", file=sys.stderr)
-        return 1
+        op_name = getattr(operation, "name", "<unknown>")
+        print(f"Operation: {op_name}", file=sys.stderr)
 
-    output_path = Path(args.filename).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+        elapsed = 0.0
+        while not getattr(operation, "done", False):
+            if elapsed >= args.max_poll_seconds:
+                msg = (
+                    f"Veo operation did not complete within "
+                    f"--max-poll-seconds={args.max_poll_seconds:.0f}s"
+                )
+                print(
+                    f"Error: {msg}. "
+                    f"Operation name '{op_name}' may still be retrievable for up to 2 days; "
+                    f"re-run with --extend-from or use a fresh prompt.",
+                    file=sys.stderr,
+                )
+                p.fail(msg, last_stage="rendering")
+                return 1
+            time.sleep(args.poll_interval)
+            elapsed += args.poll_interval
+            try:
+                operation = client.operations.get(operation)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Error: poll failed at {elapsed:.0f}s: {exc}", file=sys.stderr)
+                p.fail(f"poll failed at {elapsed:.0f}s: {exc}", last_stage="rendering")
+                return 1
+            # Keep the stderr log for operator visibility; p.update is the
+            # user-facing signal (throttled to Slack chat.update's 3s floor).
+            print(f"Polling... ({elapsed:.0f}s elapsed)", file=sys.stderr)
+            p.update("rendering", elapsed_sec=elapsed)
 
-    try:
-        # The SDK's Video object exposes .save(path) which writes the MP4 bytes.
-        video_obj.save(str(output_path))
-    except Exception as exc:  # noqa: BLE001
-        print(f"Error: failed to save video: {exc}", file=sys.stderr)
-        return 1
+        # Success path: pull the first video, save to --filename.
+        p.update("finalizing", elapsed_sec=elapsed)
+        try:
+            video_obj = operation.response.generated_videos[0].video
+        except (AttributeError, IndexError) as exc:
+            print(f"Error: no video in operation response: {exc}", file=sys.stderr)
+            p.fail(f"no video in operation response: {exc}", last_stage="finalizing")
+            return 1
 
-    print(f"MEDIA: {output_path}")
-    return 0
+        output_path = Path(args.filename).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # The SDK's Video object exposes .save(path) which writes the MP4 bytes.
+            video_obj.save(str(output_path))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error: failed to save video: {exc}", file=sys.stderr)
+            p.fail(f"failed to save video: {exc}", last_stage="finalizing")
+            return 1
+
+        # MEDIA: token first (agent stdout parser) — send_video MCP delivers
+        # the bytes. p.done() second — orchestrator updates the anchor text.
+        print(f"MEDIA: {output_path}")
+        p.done(str(output_path))
+        return 0
 
 
 def main() -> int:
