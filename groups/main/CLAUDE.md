@@ -42,6 +42,30 @@ The `veo` skill ships three scripts. Read `/app/skills/veo/SKILL.md` for the ful
 
 **Delivery.** After any script prints `MEDIA: <path>` on its final stdout line, call the `send_video` MCP tool with that path. Only `.mp4` files are accepted. The container holds the file briefly — don't delete it right after the call (delivery may be queued during reconnects).
 
+### Progress feedback (automatic)
+
+`generate_video.py` emits structured progress events through a shared helper at `/app/lib/progress.py`. You do not need to read or write progress events — the orchestrator handles them — but it's useful to know what the user sees while a render is running.
+
+- On long renders the user sees a single anchor message that updates through the lifecycle: `queued → rendering → finalizing → done`. On Slack the orchestrator edits the message in place (one message per request); on channels without edit-in-place it falls back to one append per stage transition.
+- The anchor renders as an SBAR slot block with `Stage / Elapsed / ETA / Next` so the user can read the state at a glance.
+- If a render stops emitting events for ~90s (container killed mid-poll, provider hang), the orchestrator's watchdog overwrites the anchor with `⚠️ Render stalled — last seen at the {stage} stage`. No further action is required from you; the watchdog runs below the agent.
+- On producer-known failure (quota, prompt-rejected) the anchor becomes `⚠️ Video render failed` with the reason inline.
+- The actual MP4 still flows through `send_video`. The progress layer only updates the anchor TEXT; it does not deliver media.
+
+**Adding a new video model.** When you wire up a new producer (Omni, Sora, etc.), import the helper at the top:
+
+```python
+from progress import progress
+
+with progress("omni", request_id, model_id="omni-1.0") as p:
+    # ... poll loop ...
+    p.update("rendering", elapsed_sec=elapsed)
+    # ... save output ...
+    p.done(output_path)
+```
+
+`chat_jid` is read from `NANOCLAW_CHAT_JID` automatically. `request_id` should be a stable `uuid4().hex`. Nothing else needs to change — no IPC schema, no orchestrator, no channel.
+
 ## Inbound Media (`inbox/`)
 
 When the Boss attaches an image or video to a Slack message, the orchestrator downloads it and writes it to `inbox/` inside your workspace. You'll see a marker block at the end of the message:
