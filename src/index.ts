@@ -30,6 +30,7 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
+  getActiveAnchorsStaleBefore,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -40,6 +41,7 @@ import {
   getNewMessages,
   getRouterState,
   initDatabase,
+  markAnchorTerminal,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -69,6 +71,10 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
+import {
+  startProgressWatchdog,
+  stopProgressWatchdog,
+} from './progress-watchdog.js';
 import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import {
@@ -679,6 +685,7 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    stopProgressWatchdog();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -844,6 +851,16 @@ async function main(): Promise<void> {
     },
   });
   startSessionCleanup();
+  // Watch in-flight video-progress anchors so a container killed mid-render
+  // (5min default container timeout) can never produce silent abandonment.
+  // Fires routeFailureNotice(..., 'stalled') with the anchor handle so the
+  // user's anchor message is overwritten in place rather than orphaned.
+  startProgressWatchdog({
+    getActiveAnchorsStaleBefore,
+    markAnchorTerminal,
+    routeFailureNotice: (jid, kind, ctx) =>
+      routeFailureNotice(channels, jid, kind, ctx),
+  });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
   startMessageLoop().catch((err) => {

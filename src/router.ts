@@ -94,43 +94,85 @@ export function findChannel(
   return channels.find((c) => c.ownsJid(jid));
 }
 
-// User-facing apology messages for the three silent-failure modes the
-// orchestrator can detect when running an agent turn.
+// User-facing apology messages for the failure modes the orchestrator can
+// detect when running an agent turn.
 //
-// - 'pre'    : the agent errored before streaming any output to the user.
-//              They saw "Got it, working on it..." and then silence.
-// - 'mid'    : the agent streamed something useful, then errored. They saw
-//              partial output and the rest never landed.
-// - 'silent' : the agent reported success but never emitted any text. They
-//              saw "Got it, working on it..." and then a graceful return
-//              with no follow-up — indistinguishable from a hang.
+// - 'pre'     : the agent errored before streaming any output to the user.
+//               They saw "Got it, working on it..." and then silence.
+// - 'mid'     : the agent streamed something useful, then errored. They saw
+//               partial output and the rest never landed.
+// - 'silent'  : the agent reported success but never emitted any text. They
+//               saw "Got it, working on it..." and then a graceful return
+//               with no follow-up — indistinguishable from a hang.
+// - 'stalled' : the video-progress watchdog detected an in-flight render
+//               that stopped emitting events past the configured threshold.
+//               Fired by src/progress-watchdog.ts, never from agent state.
 //
 // The orchestrator dispatches via this lookup so the failure pathway
 // stays out of the per-channel handlers and is unit-testable in isolation.
-export type FailureKind = 'pre' | 'mid' | 'silent';
+export type FailureKind = 'pre' | 'mid' | 'silent' | 'stalled';
 
 const FAILURE_COPY: Record<FailureKind, string> = {
   pre: '⚠️ Something broke on my end before I could finish. Try again?',
   mid: '⚠️ Got cut off mid-reply. Want me to retry?',
   silent:
     "⚠️ I'm here, but nothing useful came back from that run. Mind rephrasing or trying again?",
+  // {stage} is interpolated by the caller when an anchor's last_stage is
+  // known; falls back to a generic copy otherwise.
+  stalled:
+    '⚠️ Render stalled — last seen at the {stage} stage. Want me to retry?',
 };
 
-export function failureNoticeText(kind: FailureKind): string {
-  return FAILURE_COPY[kind];
+export function failureNoticeText(
+  kind: FailureKind,
+  ctx?: { lastStage?: string },
+): string {
+  const copy = FAILURE_COPY[kind];
+  if (kind === 'stalled') {
+    return copy.replace(
+      '{stage}',
+      ctx?.lastStage ? ctx.lastStage : 'last known',
+    );
+  }
+  return copy;
+}
+
+export interface FailureNoticeContext {
+  anchorHandle?: MessageHandle;
+  lastStage?: string;
 }
 
 export async function routeFailureNotice(
   channels: Channel[],
   jid: string,
   kind: FailureKind,
+  ctx?: FailureNoticeContext,
 ): Promise<void> {
   const channel = channels.find((c) => c.ownsJid(jid) && c.isConnected());
   // Swallow when the channel is unreachable — the failure notice is a
   // best-effort overlay on top of an already-failed turn. Logging is the
   // caller's responsibility so the error path stays narrow here.
   if (!channel) return;
-  await channel.sendMessage(jid, failureNoticeText(kind));
+
+  const text = failureNoticeText(kind, ctx);
+
+  // Edit-in-place when an anchor handle is present AND the channel supports
+  // updateMessage — keeps the watchdog's "stalled" notice from leaving an
+  // orphaned in-progress anchor behind it.
+  if (ctx?.anchorHandle && channel.updateMessage) {
+    try {
+      await channel.updateMessage(jid, ctx.anchorHandle, text);
+    } catch (err) {
+      logger.warn(
+        { jid, kind, err },
+        'routeFailureNotice updateMessage failed, falling back to sendMessage',
+      );
+      await channel.sendMessage(jid, text);
+    }
+    return;
+  }
+
+  await channel.sendMessage(jid, text);
 }
 
 // --- Progress feedback routing (video-progress layer) ---

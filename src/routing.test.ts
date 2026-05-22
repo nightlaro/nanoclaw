@@ -296,7 +296,23 @@ describe('failureNoticeText', () => {
     const pre = failureNoticeText('pre');
     const mid = failureNoticeText('mid');
     const silent = failureNoticeText('silent');
-    expect(new Set([pre, mid, silent]).size).toBe(3);
+    const stalled = failureNoticeText('stalled');
+    expect(new Set([pre, mid, silent, stalled]).size).toBe(4);
+  });
+
+  it('returns a stalled apology that interpolates the last stage when supplied', () => {
+    const text = failureNoticeText('stalled', { lastStage: 'rendering' });
+    expect(text).toMatch(/⚠️/);
+    expect(text.toLowerCase()).toContain('stalled');
+    expect(text).toContain('rendering');
+    expect(text).not.toContain('{stage}');
+  });
+
+  it('returns a stalled apology with a generic fallback when stage unknown', () => {
+    const text = failureNoticeText('stalled');
+    expect(text).toMatch(/⚠️/);
+    expect(text.toLowerCase()).toContain('stalled');
+    expect(text).not.toContain('{stage}');
   });
 });
 
@@ -344,6 +360,90 @@ describe('routeFailureNotice', () => {
       routeFailureNotice([ch], 'slack:C1', 'pre'),
     ).resolves.toBeUndefined();
     expect(ch.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('edits the anchor in place when ctx.anchorHandle + updateMessage are present', async () => {
+    const updateMessage = vi.fn(async () => undefined);
+    const sendMessage = vi.fn(async () => undefined);
+    const ch = {
+      name: 'test',
+      ownsJid: (j: string) => j === 'slack:C1',
+      isConnected: () => true,
+      sendMessage,
+      updateMessage,
+      connect: async () => undefined,
+      disconnect: async () => undefined,
+    } as unknown as import('./types.js').Channel;
+
+    await routeFailureNotice([ch], 'slack:C1', 'stalled', {
+      anchorHandle: 'C1:1.0',
+      lastStage: 'rendering',
+    });
+
+    expect(updateMessage).toHaveBeenCalledWith(
+      'slack:C1',
+      'C1:1.0',
+      expect.stringContaining('rendering'),
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('falls back to sendMessage when updateMessage rejects (ctx present)', async () => {
+    const updateMessage = vi.fn(async () => {
+      throw new Error('update_failed');
+    });
+    const sendMessage = vi.fn(async () => undefined);
+    const ch = {
+      name: 'test',
+      ownsJid: (j: string) => j === 'slack:C1',
+      isConnected: () => true,
+      sendMessage,
+      updateMessage,
+      connect: async () => undefined,
+      disconnect: async () => undefined,
+    } as unknown as import('./types.js').Channel;
+
+    await routeFailureNotice([ch], 'slack:C1', 'stalled', {
+      anchorHandle: 'C1:1.0',
+      lastStage: 'rendering',
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      'slack:C1',
+      expect.stringContaining('rendering'),
+    );
+  });
+
+  it('uses sendMessage when channel lacks updateMessage even with anchor handle', async () => {
+    const ch = makeChannel((j) => j === 'slack:C1');
+    await routeFailureNotice([ch], 'slack:C1', 'stalled', {
+      anchorHandle: 'C1:1.0',
+      lastStage: 'queued',
+    });
+    expect(ch.sendMessage).toHaveBeenCalledWith(
+      'slack:C1',
+      expect.stringContaining('queued'),
+    );
+  });
+
+  it('uses sendMessage when ctx has no anchor handle', async () => {
+    const ch = makeChannel((j) => j === 'slack:C1');
+    await routeFailureNotice([ch], 'slack:C1', 'stalled', {
+      lastStage: 'rendering',
+    });
+    expect(ch.sendMessage).toHaveBeenCalledWith(
+      'slack:C1',
+      expect.stringContaining('rendering'),
+    );
+  });
+
+  it('existing 3-arg call sites continue to work unchanged', async () => {
+    const ch = makeChannel((j) => j === 'slack:C1');
+    await routeFailureNotice([ch], 'slack:C1', 'pre');
+    expect(ch.sendMessage).toHaveBeenCalledWith(
+      'slack:C1',
+      failureNoticeText('pre'),
+    );
   });
 });
 
