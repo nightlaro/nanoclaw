@@ -8,7 +8,20 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { MessageHandle, RegisteredGroup } from './types.js';
+import {
+  MessageHandle,
+  ProgressEvent,
+  RegisteredGroup,
+} from './types.js';
+import {
+  deleteAnchor,
+  getProgressAnchor,
+  markAnchorTerminal,
+  ProgressAnchor,
+  ProgressAnchorInput,
+  updateAnchorLastProcessed,
+  upsertProgressAnchor,
+} from './db.js';
 
 export interface IpcDeps {
   // Widened return type lets the progress consumer (U6) capture the anchor
@@ -20,6 +33,16 @@ export interface IpcDeps {
   ) => Promise<MessageHandle | undefined>;
   sendImage: (jid: string, paths: string[], caption?: string) => Promise<void>;
   sendVideo: (jid: string, paths: string[], caption?: string) => Promise<void>;
+  // Routes a producer ProgressEvent through the channel layer — edit-in-place
+  // when an anchor handle is present and the channel supports it, append
+  // otherwise. Bypasses deduplicatedSend so rapid stage transitions are not
+  // silently swallowed. Returns the new anchor handle on initial post, or
+  // undefined when editing or when the channel can't produce an anchor.
+  routeProgressNotice: (
+    jid: string,
+    event: ProgressEvent,
+    anchorHandle: MessageHandle | undefined,
+  ) => Promise<MessageHandle | undefined>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -234,6 +257,68 @@ export function startIpcWatcher(deps: IpcDeps): void {
         logger.error(
           { err, sourceGroup },
           'Error reading IPC videos directory',
+        );
+      }
+
+      // Process progress IPC files. Critically diverges from the namespaces
+      // above: non-terminal events do NOT unlink the file (the watchdog reads
+      // last_update_at from SQLite, not the file). Only terminal kinds and
+      // stale-leftover files are unlinked. Malformed/unauthorized payloads
+      // are left on disk for post-mortem inspection rather than quarantined.
+      const progressDir = path.join(ipcBaseDir, sourceGroup, 'progress');
+      try {
+        if (fs.existsSync(progressDir)) {
+          const progressFiles = fs
+            .readdirSync(progressDir)
+            .filter((f) => f.endsWith('.json'));
+          for (const file of progressFiles) {
+            const filePath = path.join(progressDir, file);
+            try {
+              const data = JSON.parse(
+                fs.readFileSync(filePath, 'utf-8'),
+              ) as ProgressEvent;
+              const { shouldUnlink } = await processProgressIpcFile(
+                data,
+                sourceGroup,
+                isMain,
+                registeredGroups,
+                {
+                  getAnchor: getProgressAnchor,
+                  upsertAnchor: upsertProgressAnchor,
+                  markTerminal: markAnchorTerminal,
+                  updateLastProcessed: updateAnchorLastProcessed,
+                },
+                deps.routeProgressNotice,
+              );
+              if (shouldUnlink) {
+                try {
+                  fs.unlinkSync(filePath);
+                  // Best-effort delete the anchor row for terminal cleanup —
+                  // the watchdog already skips terminal anchors via the
+                  // (terminal_state IS NULL) predicate, but leaving them
+                  // around forever bloats the DB.
+                  deleteAnchor(data.request_id);
+                } catch {
+                  // File may have been unlinked by a concurrent process;
+                  // ignore so the consumer doesn't crash on a race.
+                }
+              }
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC progress event',
+              );
+              // Do NOT move malformed progress files to errors/ — leaving
+              // the file in place lets the producer's next emit (latest-wins)
+              // overwrite it cleanly. A persistently broken producer surfaces
+              // via the logged error.
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading IPC progress directory',
         );
       }
     }
@@ -630,6 +715,166 @@ export interface VideoIpcPayload {
   paths?: string[];
   caption?: string;
   timestamp?: string;
+}
+
+// --- Progress IPC consumer (video-progress feedback layer) ---
+
+export interface ProgressIpcAccessors {
+  getAnchor: (requestId: string) => ProgressAnchor | undefined;
+  upsertAnchor: (input: ProgressAnchorInput) => void;
+  markTerminal: (
+    requestId: string,
+    terminalState: 'completed' | 'failed' | 'stalled' | 'anchor_lost',
+    lastStage?: string,
+  ) => void;
+  updateLastProcessed: (
+    requestId: string,
+    emittedAt: string,
+    lastUpdateAt: string,
+    lastStage?: string,
+  ) => void;
+}
+
+function channelNameFromJid(jid: string): string {
+  if (jid.startsWith('slack:')) return 'slack';
+  if (jid.startsWith('tg:')) return 'telegram';
+  if (jid.startsWith('dc:')) return 'discord';
+  if (jid.endsWith('@g.us') || jid.endsWith('@s.whatsapp.net'))
+    return 'whatsapp';
+  return 'unknown';
+}
+
+function isValidProgressEvent(data: unknown): data is ProgressEvent {
+  if (!data || typeof data !== 'object') return false;
+  const d = data as Record<string, unknown>;
+  return (
+    typeof d.request_id === 'string' &&
+    typeof d.chat_jid === 'string' &&
+    typeof d.kind === 'string' &&
+    typeof d.stage === 'string' &&
+    typeof d.elapsed_sec === 'number' &&
+    typeof d.emitted_at === 'string'
+  );
+}
+
+/**
+ * Pure-function consumer for one progress IPC event. Returns whether the
+ * caller should unlink the file (terminal or stale-leftover) or leave it
+ * for the next poll tick (in-flight, dedup-skipped, or malformed).
+ *
+ * Diverges from the other IPC consumers in two ways the doc-review
+ * surfaced as load-bearing:
+ *  - Non-terminal files persist; the watchdog reads SQLite, not file mtime.
+ *  - Event-sequence dedup via last_processed_emitted_at on the anchor row
+ *    prevents the 1s IPC poll from re-firing updates for the same content.
+ *
+ * The orchestrator's per-jid `outputSentToUser` flag (src/index.ts) MUST
+ * NOT be touched here: retry-on-error semantics depend on the flag staying
+ * false until the agent's actual streamed text lands. Progress events are
+ * not "agent output."
+ */
+export async function processProgressIpcFile(
+  data: ProgressEvent,
+  sourceGroup: string,
+  isMain: boolean,
+  registeredGroups: Record<string, RegisteredGroup>,
+  accessors: ProgressIpcAccessors,
+  routeProgressNotice: (
+    jid: string,
+    event: ProgressEvent,
+    anchorHandle: MessageHandle | undefined,
+  ) => Promise<MessageHandle | undefined>,
+): Promise<{ shouldUnlink: boolean }> {
+  if (!isValidProgressEvent(data)) {
+    logger.warn(
+      { data, sourceGroup },
+      'Malformed progress IPC payload, skipping (file kept for diagnostic)',
+    );
+    return { shouldUnlink: false };
+  }
+
+  const targetGroup = registeredGroups[data.chat_jid];
+  if (!(isMain || (targetGroup && targetGroup.folder === sourceGroup))) {
+    logger.warn(
+      { chatJid: data.chat_jid, sourceGroup },
+      'Unauthorized progress IPC attempt blocked',
+    );
+    return { shouldUnlink: false };
+  }
+
+  const anchor = accessors.getAnchor(data.request_id);
+  const isTerminal = data.kind === 'done' || data.kind === 'failed';
+  const terminalState: 'completed' | 'failed' =
+    data.kind === 'done' ? 'completed' : 'failed';
+
+  // Stale leftover: anchor already terminal. Drop the file silently.
+  if (anchor && anchor.terminal_state !== null) {
+    return { shouldUnlink: true };
+  }
+
+  // Event-sequence dedup: skip when emitted_at is not strictly newer than
+  // the last event we processed. Without this the 1s IPC poll re-fires
+  // updateMessage for the same file content every tick.
+  if (
+    anchor &&
+    anchor.last_processed_emitted_at !== null &&
+    data.emitted_at <= anchor.last_processed_emitted_at
+  ) {
+    return { shouldUnlink: false };
+  }
+
+  const now = new Date().toISOString();
+
+  // No anchor yet → first time we see this request. Post the initial
+  // anchor, capture the handle, and persist the row.
+  if (!anchor) {
+    const handle = await routeProgressNotice(
+      data.chat_jid,
+      data,
+      undefined,
+    );
+
+    if (handle !== undefined) {
+      accessors.upsertAnchor({
+        request_id: data.request_id,
+        chat_jid: data.chat_jid,
+        channel: channelNameFromJid(data.chat_jid),
+        handle,
+        last_stage: data.stage,
+        model_id: data.model_id ?? null,
+        created_at: now,
+        last_update_at: now,
+      });
+      accessors.updateLastProcessed(
+        data.request_id,
+        data.emitted_at,
+        now,
+        data.stage,
+      );
+      if (isTerminal) {
+        accessors.markTerminal(data.request_id, terminalState, data.stage);
+      }
+    }
+    return { shouldUnlink: isTerminal };
+  }
+
+  // Anchor exists, non-terminal: dispatch the update through the channel
+  // (edit-in-place when supported, suppressed tick otherwise — the router
+  // owns the channel-policy decision).
+  await routeProgressNotice(data.chat_jid, data, anchor.handle);
+
+  if (isTerminal) {
+    accessors.markTerminal(data.request_id, terminalState, data.stage);
+    return { shouldUnlink: true };
+  }
+
+  accessors.updateLastProcessed(
+    data.request_id,
+    data.emitted_at,
+    now,
+    data.stage,
+  );
+  return { shouldUnlink: false };
 }
 
 export async function processVideoIpcFile(

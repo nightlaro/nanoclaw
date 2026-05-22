@@ -55,6 +55,7 @@ beforeEach(() => {
     sendMessage: async () => undefined,
     sendImage: async () => {},
     sendVideo: async () => {},
+    routeProgressNotice: async () => undefined,
     registeredGroups: () => groups,
     registerGroup: (jid, group) => {
       groups[jid] = group;

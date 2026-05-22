@@ -1,4 +1,5 @@
-import { Channel, NewMessage } from './types.js';
+import { logger } from './logger.js';
+import { Channel, MessageHandle, NewMessage, ProgressEvent } from './types.js';
 import { formatLocalTime } from './timezone.js';
 
 export function escapeXml(s: string): string {
@@ -130,4 +131,118 @@ export async function routeFailureNotice(
   // caller's responsibility so the error path stays narrow here.
   if (!channel) return;
   await channel.sendMessage(jid, failureNoticeText(kind));
+}
+
+// --- Progress feedback routing (video-progress layer) ---
+
+/**
+ * Format a producer-emitted ProgressEvent into an SBAR-style slot block.
+ * Stable scannable layout the user can parse at a glance:
+ *
+ *   🎬 Video render
+ *   Stage:   rendering
+ *   Elapsed: 23s
+ *   ETA:     ~37s
+ *   Next:    finalizing
+ *
+ * Terminal kinds use distinct icons; failure includes the producer reason.
+ */
+export function renderProgressEvent(event: ProgressEvent): string {
+  const elapsed = formatElapsedSec(event.elapsed_sec);
+  const lines: string[] = [];
+
+  switch (event.kind) {
+    case 'started':
+    case 'tick':
+    case 'stage':
+      lines.push('🎬 Video render');
+      lines.push(`Stage:   ${event.stage}`);
+      lines.push(`Elapsed: ${elapsed}`);
+      if (event.eta_sec !== undefined) {
+        lines.push(`ETA:     ~${formatElapsedSec(event.eta_sec)}`);
+      }
+      if (event.percent !== undefined) {
+        lines.push(`Percent: ${Math.round(event.percent)}%`);
+      }
+      if (event.next_stage) {
+        lines.push(`Next:    ${event.next_stage}`);
+      }
+      break;
+    case 'done':
+      lines.push('✅ Video render complete');
+      lines.push(`Stage:   ${event.stage}`);
+      lines.push(`Elapsed: ${elapsed}`);
+      break;
+    case 'failed':
+      lines.push('⚠️ Video render failed');
+      lines.push(`Stage:   ${event.stage}`);
+      if (event.reason) {
+        lines.push(`Reason:  ${event.reason}`);
+      }
+      break;
+  }
+
+  return lines.join('\n');
+}
+
+function formatElapsedSec(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0s';
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return s ? `${m}m${s}s` : `${m}m`;
+}
+
+/**
+ * Channel-agnostic dispatcher for progress events. Mirrors routeFailureNotice:
+ * silent when no channel owns the JID, never throws. Edit-in-place via
+ * Channel.updateMessage? when a handle is present and the channel supports it;
+ * otherwise falls back to sendMessage and suppresses intra-stage ticks (R10).
+ *
+ * Critically does NOT go through deduplicatedSend: the 5s/200-char window
+ * in src/index.ts would silently drop progress updates that hash identically.
+ */
+export async function routeProgressNotice(
+  channels: Channel[],
+  jid: string,
+  event: ProgressEvent,
+  anchorHandle: MessageHandle | undefined,
+): Promise<MessageHandle | undefined> {
+  const channel = channels.find((c) => c.ownsJid(jid) && c.isConnected());
+  if (!channel) {
+    logger.warn(
+      { jid, kind: event.kind },
+      'No connected channel owns JID for progress event, skipping',
+    );
+    return undefined;
+  }
+
+  const text = renderProgressEvent(event);
+
+  // Edit-in-place path: anchor present AND channel implements updateMessage.
+  if (anchorHandle && channel.updateMessage) {
+    try {
+      await channel.updateMessage(jid, anchorHandle, text);
+    } catch (err) {
+      logger.warn(
+        { jid, kind: event.kind, err },
+        'Progress updateMessage failed',
+      );
+    }
+    return undefined;
+  }
+
+  // Append-fallback for handle-less / non-edit channels (R10): only emit on
+  // stage transitions, started, and terminal events. Suppress 'tick' so the
+  // channel isn't flooded with per-poll updates.
+  if (event.kind === 'tick') {
+    return undefined;
+  }
+
+  try {
+    return await channel.sendMessage(jid, text);
+  } catch (err) {
+    logger.warn({ jid, kind: event.kind, err }, 'Progress sendMessage failed');
+    return undefined;
+  }
 }

@@ -56,6 +56,7 @@ import {
   routeFailureNotice,
   routeOutboundImage,
   routeOutboundVideo,
+  routeProgressNotice,
 } from './router.js';
 import {
   restoreRemoteControl,
@@ -808,6 +809,11 @@ async function main(): Promise<void> {
       routeOutboundImage(channels, jid, paths, caption),
     sendVideo: (jid, paths, caption) =>
       routeOutboundVideo(channels, jid, paths, caption),
+    // Progress events bypass deduplicatedSend (the 5s/200-char dedup window
+    // would silently drop rapid stage transitions). They also bypass the
+    // outputSentToUser per-jid flag — see comment in processProgressIpcFile.
+    routeProgressNotice: (jid, event, anchorHandle) =>
+      routeProgressNotice(channels, jid, event, anchorHandle),
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroups: async (force: boolean) => {

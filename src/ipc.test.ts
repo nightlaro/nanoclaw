@@ -7,8 +7,14 @@ vi.mock('./logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { processImageIpcFile, processVideoIpcFile } from './ipc.js';
-import { RegisteredGroup } from './types.js';
+import {
+  processImageIpcFile,
+  processProgressIpcFile,
+  ProgressIpcAccessors,
+} from './ipc.js';
+import { ProgressAnchor } from './db.js';
+import { processVideoIpcFile } from './ipc.js';
+import { ProgressEvent, RegisteredGroup, MessageHandle } from './types.js';
 
 const MAIN_GROUP: RegisteredGroup = {
   name: 'Main',
@@ -382,5 +388,387 @@ describe('processVideoIpcFile', () => {
     );
 
     expect(sendVideo).not.toHaveBeenCalled();
+  });
+});
+
+// --- processProgressIpcFile ---
+
+describe('processProgressIpcFile', () => {
+  let getAnchor: ReturnType<
+    typeof vi.fn<(requestId: string) => ProgressAnchor | undefined>
+  >;
+  let upsertAnchor: ProgressIpcAccessors['upsertAnchor'] & {
+    mock: ReturnType<typeof vi.fn>['mock'];
+  };
+  let markTerminal: ProgressIpcAccessors['markTerminal'] & {
+    mock: ReturnType<typeof vi.fn>['mock'];
+  };
+  let updateLastProcessed: ProgressIpcAccessors['updateLastProcessed'] & {
+    mock: ReturnType<typeof vi.fn>['mock'];
+  };
+  let routeProgress: ((
+    jid: string,
+    event: ProgressEvent,
+    handle: MessageHandle | undefined,
+  ) => Promise<MessageHandle | undefined>) & {
+    mock: ReturnType<typeof vi.fn>['mock'];
+    mockResolvedValueOnce: (value: MessageHandle | undefined) => unknown;
+  };
+
+  beforeEach(() => {
+    getAnchor = vi.fn(() => undefined);
+    upsertAnchor = vi.fn() as unknown as typeof upsertAnchor;
+    markTerminal = vi.fn() as unknown as typeof markTerminal;
+    updateLastProcessed = vi.fn() as unknown as typeof updateLastProcessed;
+    routeProgress = vi.fn(
+      async () => undefined,
+    ) as unknown as typeof routeProgress;
+  });
+
+  function accessors(): ProgressIpcAccessors {
+    return {
+      getAnchor,
+      upsertAnchor,
+      markTerminal,
+      updateLastProcessed,
+    };
+  }
+
+  function registered() {
+    return {
+      'slack:C1': SLACK_TEST,
+      'slack:Cmain': MAIN_GROUP,
+    };
+  }
+
+  function ev(overrides: Partial<ProgressEvent> = {}): ProgressEvent {
+    return {
+      request_id: 'req-1',
+      chat_jid: 'slack:C1',
+      kind: 'started',
+      stage: 'queued',
+      elapsed_sec: 0,
+      emitted_at: '2026-05-21T00:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  function anchorRow(overrides: Partial<ProgressAnchor> = {}): ProgressAnchor {
+    return {
+      request_id: 'req-1',
+      chat_jid: 'slack:C1',
+      channel: 'slack',
+      handle: 'C1:1.0',
+      last_stage: 'queued',
+      model_id: 'veo-3.1',
+      created_at: '2026-05-21T00:00:00.000Z',
+      last_update_at: '2026-05-21T00:00:00.000Z',
+      last_processed_emitted_at: '2026-05-21T00:00:00.000Z',
+      terminal_state: null,
+      ...overrides,
+    };
+  }
+
+  it('on fresh started event posts initial anchor and upserts with handle', async () => {
+    routeProgress.mockResolvedValueOnce('C1:1700000000.000001');
+
+    const result = await processProgressIpcFile(
+      ev({ kind: 'started' }),
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).toHaveBeenCalledWith(
+      'slack:C1',
+      expect.objectContaining({ kind: 'started' }),
+      undefined,
+    );
+    expect(upsertAnchor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request_id: 'req-1',
+        chat_jid: 'slack:C1',
+        handle: 'C1:1700000000.000001',
+        last_stage: 'queued',
+        model_id: null,
+        channel: 'slack',
+      }),
+    );
+    expect(updateLastProcessed).toHaveBeenCalledWith(
+      'req-1',
+      '2026-05-21T00:00:00.000Z',
+      expect.any(String),
+      'queued',
+    );
+    expect(markTerminal).not.toHaveBeenCalled();
+    expect(result.shouldUnlink).toBe(false);
+  });
+
+  it('on tick when anchor exists, calls routeProgress with stored handle', async () => {
+    getAnchor.mockReturnValueOnce(anchorRow());
+
+    const result = await processProgressIpcFile(
+      ev({
+        kind: 'tick',
+        stage: 'rendering',
+        elapsed_sec: 10,
+        emitted_at: '2026-05-21T00:00:10.000Z',
+      }),
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).toHaveBeenCalledWith(
+      'slack:C1',
+      expect.objectContaining({ kind: 'tick' }),
+      'C1:1.0',
+    );
+    expect(updateLastProcessed).toHaveBeenCalledWith(
+      'req-1',
+      '2026-05-21T00:00:10.000Z',
+      expect.any(String),
+      'rendering',
+    );
+    expect(markTerminal).not.toHaveBeenCalled();
+    expect(result.shouldUnlink).toBe(false);
+  });
+
+  it('on terminal done marks terminal=completed and signals unlink', async () => {
+    getAnchor.mockReturnValueOnce(anchorRow());
+
+    const result = await processProgressIpcFile(
+      ev({
+        kind: 'done',
+        stage: 'uploading',
+        elapsed_sec: 60,
+        media_path: '/workspace/group/outbox/out.mp4',
+        emitted_at: '2026-05-21T00:01:00.000Z',
+      }),
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).toHaveBeenCalledWith(
+      'slack:C1',
+      expect.objectContaining({ kind: 'done' }),
+      'C1:1.0',
+    );
+    expect(markTerminal).toHaveBeenCalledWith('req-1', 'completed', 'uploading');
+    expect(result.shouldUnlink).toBe(true);
+  });
+
+  it('on terminal failed marks terminal=failed with reason in event', async () => {
+    getAnchor.mockReturnValueOnce(anchorRow());
+
+    const result = await processProgressIpcFile(
+      ev({
+        kind: 'failed',
+        stage: 'rendering',
+        elapsed_sec: 20,
+        reason: 'quota exhausted',
+        emitted_at: '2026-05-21T00:00:20.000Z',
+      }),
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(markTerminal).toHaveBeenCalledWith('req-1', 'failed', 'rendering');
+    expect(result.shouldUnlink).toBe(true);
+  });
+
+  it('stale leftover: anchor already terminal, file should be unlinked silently', async () => {
+    getAnchor.mockReturnValueOnce(
+      anchorRow({ terminal_state: 'completed' }),
+    );
+
+    const result = await processProgressIpcFile(
+      ev({ kind: 'started' }),
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).not.toHaveBeenCalled();
+    expect(markTerminal).not.toHaveBeenCalled();
+    expect(updateLastProcessed).not.toHaveBeenCalled();
+    expect(result.shouldUnlink).toBe(true);
+  });
+
+  it('event-sequence dedup: emitted_at <= last_processed_emitted_at is a no-op', async () => {
+    getAnchor.mockReturnValueOnce(
+      anchorRow({ last_processed_emitted_at: '2026-05-21T00:00:10.000Z' }),
+    );
+
+    const result = await processProgressIpcFile(
+      ev({
+        kind: 'tick',
+        elapsed_sec: 10,
+        emitted_at: '2026-05-21T00:00:10.000Z', // equal — already processed
+      }),
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).not.toHaveBeenCalled();
+    expect(updateLastProcessed).not.toHaveBeenCalled();
+    expect(markTerminal).not.toHaveBeenCalled();
+    expect(result.shouldUnlink).toBe(false);
+  });
+
+  it('event-sequence dedup: strictly newer emitted_at processes normally', async () => {
+    getAnchor.mockReturnValueOnce(
+      anchorRow({ last_processed_emitted_at: '2026-05-21T00:00:10.000Z' }),
+    );
+
+    const result = await processProgressIpcFile(
+      ev({
+        kind: 'tick',
+        elapsed_sec: 11,
+        emitted_at: '2026-05-21T00:00:11.000Z',
+      }),
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).toHaveBeenCalled();
+    expect(updateLastProcessed).toHaveBeenCalled();
+    expect(result.shouldUnlink).toBe(false);
+  });
+
+  it('authorization: blocks cross-group send for non-main groups', async () => {
+    const result = await processProgressIpcFile(
+      ev(), // chat_jid 'slack:C1' belongs to SLACK_TEST
+      'slack_other', // different sourceGroup
+      false, // not main
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).not.toHaveBeenCalled();
+    expect(upsertAnchor).not.toHaveBeenCalled();
+    // File is kept for diagnostic, not unlinked
+    expect(result.shouldUnlink).toBe(false);
+  });
+
+  it('authorization: main group can route to any jid', async () => {
+    routeProgress.mockResolvedValueOnce('C1:1.x');
+    const result = await processProgressIpcFile(
+      ev({ kind: 'started' }),
+      'slack_main',
+      true, // isMain
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).toHaveBeenCalled();
+    expect(upsertAnchor).toHaveBeenCalled();
+    expect(result.shouldUnlink).toBe(false);
+  });
+
+  it('malformed payload: missing request_id is skipped (file kept for diagnostic)', async () => {
+    const result = await processProgressIpcFile(
+      {
+        chat_jid: 'slack:C1',
+        kind: 'started',
+        stage: 'queued',
+        elapsed_sec: 0,
+        emitted_at: '2026-05-21T00:00:00.000Z',
+      } as unknown as ProgressEvent,
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).not.toHaveBeenCalled();
+    expect(result.shouldUnlink).toBe(false);
+  });
+
+  it('malformed payload: missing chat_jid is skipped', async () => {
+    const result = await processProgressIpcFile(
+      {
+        request_id: 'req-1',
+        kind: 'started',
+        stage: 'queued',
+        elapsed_sec: 0,
+        emitted_at: '2026-05-21T00:00:00.000Z',
+      } as unknown as ProgressEvent,
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).not.toHaveBeenCalled();
+    expect(result.shouldUnlink).toBe(false);
+  });
+
+  it('no handle returned for fresh started event: still tracks dedup cursor', async () => {
+    // Channel without updateMessage capability returns undefined from
+    // routeProgressNotice. The consumer can't track anchor edits, but
+    // should still respect dedup so the same file isn't re-dispatched.
+    routeProgress.mockResolvedValueOnce(undefined);
+
+    const result = await processProgressIpcFile(
+      ev({ kind: 'started' }),
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).toHaveBeenCalled();
+    expect(upsertAnchor).not.toHaveBeenCalled(); // no handle → no anchor
+    expect(result.shouldUnlink).toBe(false);
+  });
+
+  it('terminal kind without prior anchor still unlinks the file', async () => {
+    // Rare race: terminal arrives without a prior started (e.g. orchestrator
+    // restarted between started and done). routeProgress is invoked so the
+    // user still sees the terminal render; the file is unlinked.
+    const result = await processProgressIpcFile(
+      ev({
+        kind: 'done',
+        stage: 'uploading',
+        elapsed_sec: 60,
+        emitted_at: '2026-05-21T00:01:00.000Z',
+      }),
+      'slack_test',
+      false,
+      registered(),
+      accessors(),
+      routeProgress,
+    );
+
+    expect(routeProgress).toHaveBeenCalledWith(
+      'slack:C1',
+      expect.objectContaining({ kind: 'done' }),
+      undefined,
+    );
+    expect(result.shouldUnlink).toBe(true);
   });
 });

@@ -4,10 +4,13 @@ import { _initTestDatabase, storeChatMetadata } from './db.js';
 import { getAvailableGroups, _setRegisteredGroups } from './index.js';
 import {
   failureNoticeText,
+  renderProgressEvent,
   routeFailureNotice,
   routeOutboundImage,
   routeOutboundVideo,
+  routeProgressNotice,
 } from './router.js';
+import type { ProgressEvent } from './types.js';
 
 beforeEach(() => {
   _initTestDatabase();
@@ -341,5 +344,282 @@ describe('routeFailureNotice', () => {
       routeFailureNotice([ch], 'slack:C1', 'pre'),
     ).resolves.toBeUndefined();
     expect(ch.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+// --- renderProgressEvent ---
+
+function event(overrides: Partial<ProgressEvent> = {}): ProgressEvent {
+  return {
+    request_id: 'req-1',
+    chat_jid: 'slack:C1',
+    kind: 'tick',
+    stage: 'rendering',
+    elapsed_sec: 23,
+    emitted_at: '2026-05-21T00:00:23.000Z',
+    ...overrides,
+  };
+}
+
+describe('renderProgressEvent', () => {
+  it('renders started/tick/stage with SBAR header + stage + elapsed', () => {
+    const text = renderProgressEvent(event({ kind: 'tick' }));
+    expect(text).toContain('🎬 Video render');
+    expect(text).toContain('Stage:');
+    expect(text).toContain('rendering');
+    expect(text).toContain('Elapsed:');
+    expect(text).toContain('23s');
+  });
+
+  it('includes ETA / Percent / Next when present', () => {
+    const text = renderProgressEvent(
+      event({
+        kind: 'tick',
+        eta_sec: 37,
+        percent: 42,
+        next_stage: 'finalizing',
+      }),
+    );
+    expect(text).toContain('ETA:');
+    expect(text).toContain('~37s');
+    expect(text).toContain('Percent:');
+    expect(text).toContain('42%');
+    expect(text).toContain('Next:');
+    expect(text).toContain('finalizing');
+  });
+
+  it('omits ETA / Percent / Next when absent', () => {
+    const text = renderProgressEvent(event({ kind: 'tick' }));
+    expect(text).not.toContain('ETA:');
+    expect(text).not.toContain('Percent:');
+    expect(text).not.toContain('Next:');
+  });
+
+  it('renders done with completion header', () => {
+    const text = renderProgressEvent(
+      event({ kind: 'done', stage: 'uploading', elapsed_sec: 60 }),
+    );
+    expect(text).toContain('✅');
+    expect(text).toContain('complete');
+    expect(text).toContain('uploading');
+    expect(text).toContain('1m'); // 60s formats as 1m
+  });
+
+  it('renders failed with reason when provided', () => {
+    const text = renderProgressEvent(
+      event({
+        kind: 'failed',
+        stage: 'rendering',
+        reason: 'quota exhausted',
+      }),
+    );
+    expect(text).toContain('⚠️');
+    expect(text).toContain('failed');
+    expect(text).toContain('rendering');
+    expect(text).toContain('Reason:');
+    expect(text).toContain('quota exhausted');
+  });
+
+  it('formats elapsed_sec under 60s in seconds', () => {
+    expect(renderProgressEvent(event({ elapsed_sec: 0 }))).toContain('0s');
+    expect(renderProgressEvent(event({ elapsed_sec: 45 }))).toContain('45s');
+  });
+
+  it('formats elapsed_sec >= 60s in minutes (with seconds when nonzero)', () => {
+    expect(renderProgressEvent(event({ elapsed_sec: 60 }))).toContain('1m');
+    expect(renderProgressEvent(event({ elapsed_sec: 90 }))).toContain('1m30s');
+    expect(renderProgressEvent(event({ elapsed_sec: 125 }))).toContain('2m5s');
+  });
+});
+
+// --- routeProgressNotice ---
+
+describe('routeProgressNotice', () => {
+  function makeChannel(opts: {
+    owns?: (jid: string) => boolean;
+    connected?: boolean;
+    withUpdateMessage?: boolean;
+    sendReturns?: string | undefined;
+  }) {
+    const sendMessage = vi.fn(async () => opts.sendReturns);
+    const updateMessage = vi.fn(async () => undefined);
+    return {
+      channel: {
+        name: 'test',
+        ownsJid: opts.owns ?? ((j: string) => j === 'slack:C1'),
+        isConnected: () => opts.connected !== false,
+        sendMessage,
+        updateMessage: opts.withUpdateMessage ? updateMessage : undefined,
+        connect: async () => undefined,
+        disconnect: async () => undefined,
+      } as unknown as import('./types.js').Channel,
+      sendMessage,
+      updateMessage,
+    };
+  }
+
+  it('edits in place when handle present and channel supports update', async () => {
+    const { channel, updateMessage, sendMessage } = makeChannel({
+      withUpdateMessage: true,
+    });
+    const handle = 'C1:1700000000.000001';
+
+    const result = await routeProgressNotice(
+      [channel],
+      'slack:C1',
+      event({ kind: 'tick', elapsed_sec: 23 }),
+      handle,
+    );
+
+    expect(updateMessage).toHaveBeenCalledWith(
+      'slack:C1',
+      handle,
+      expect.stringContaining('Elapsed: 23s'),
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(result).toBeUndefined();
+  });
+
+  it('sends new message and returns handle when no anchor yet', async () => {
+    const { channel, sendMessage, updateMessage } = makeChannel({
+      withUpdateMessage: true,
+      sendReturns: 'C1:1700000001.000002',
+    });
+
+    const result = await routeProgressNotice(
+      [channel],
+      'slack:C1',
+      event({ kind: 'started' }),
+      undefined,
+    );
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(updateMessage).not.toHaveBeenCalled();
+    expect(result).toBe('C1:1700000001.000002');
+  });
+
+  it('suppresses tick events on channels without updateMessage (append-fallback)', async () => {
+    const { channel, sendMessage } = makeChannel({
+      withUpdateMessage: false,
+    });
+
+    const result = await routeProgressNotice(
+      [channel],
+      'slack:C1',
+      event({ kind: 'tick' }),
+      undefined,
+    );
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(result).toBeUndefined();
+  });
+
+  it('emits stage transitions on append-fallback channels', async () => {
+    const { channel, sendMessage } = makeChannel({
+      withUpdateMessage: false,
+      sendReturns: undefined,
+    });
+
+    await routeProgressNotice(
+      [channel],
+      'slack:C1',
+      event({ kind: 'stage', stage: 'finalizing' }),
+      undefined,
+    );
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      'slack:C1',
+      expect.stringContaining('finalizing'),
+    );
+  });
+
+  it('emits terminal events on append-fallback channels', async () => {
+    const { channel, sendMessage } = makeChannel({
+      withUpdateMessage: false,
+    });
+
+    await routeProgressNotice(
+      [channel],
+      'slack:C1',
+      event({ kind: 'done', stage: 'uploading', elapsed_sec: 60 }),
+      undefined,
+    );
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      'slack:C1',
+      expect.stringContaining('complete'),
+    );
+  });
+
+  it('silently no-ops when no channel owns the JID', async () => {
+    const { channel, sendMessage, updateMessage } = makeChannel({
+      owns: () => false,
+      withUpdateMessage: true,
+    });
+
+    const result = await routeProgressNotice(
+      [channel],
+      'slack:DOESNOTEXIST',
+      event({ kind: 'tick' }),
+      'C1:1.0',
+    );
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(updateMessage).not.toHaveBeenCalled();
+    expect(result).toBeUndefined();
+  });
+
+  it('silently no-ops when the owning channel is disconnected', async () => {
+    const { channel, sendMessage } = makeChannel({
+      connected: false,
+      withUpdateMessage: true,
+    });
+
+    await routeProgressNotice(
+      [channel],
+      'slack:C1',
+      event({ kind: 'started' }),
+      undefined,
+    );
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not throw when updateMessage rejects', async () => {
+    const { channel, updateMessage } = makeChannel({
+      withUpdateMessage: true,
+    });
+    (updateMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('chat_update_failed'),
+    );
+
+    await expect(
+      routeProgressNotice(
+        [channel],
+        'slack:C1',
+        event({ kind: 'tick' }),
+        'C1:1.0',
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it('does not throw when sendMessage rejects', async () => {
+    const { channel, sendMessage } = makeChannel({
+      withUpdateMessage: true,
+    });
+    (sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('postMessage_failed'),
+    );
+
+    await expect(
+      routeProgressNotice(
+        [channel],
+        'slack:C1',
+        event({ kind: 'started' }),
+        undefined,
+      ),
+    ).resolves.toBeUndefined();
   });
 });
