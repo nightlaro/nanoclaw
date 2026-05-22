@@ -104,10 +104,16 @@ export interface TaskRunLog {
 
 // --- Channel abstraction ---
 
+// Opaque per-channel message handle. The orchestrator stores and round-trips
+// this string without parsing — each channel encodes its own native identifier
+// (Slack: "<channelId>:<ts>"; Telegram/Discord: "<chatId>:<messageId>"). Used
+// by Channel.updateMessage? to edit a previously sent message in place.
+export type MessageHandle = string;
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(jid: string, text: string): Promise<MessageHandle | undefined>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
@@ -120,13 +126,55 @@ export interface Channel {
     jid: string,
     imagePaths: string[],
     caption?: string,
-  ): Promise<void>;
+  ): Promise<MessageHandle | undefined>;
   // Optional: send video. Channels that support video delivery implement it.
   sendVideo?(
     jid: string,
     videoPaths: string[],
     caption?: string,
+  ): Promise<MessageHandle | undefined>;
+  // Optional: edit a previously sent message in place. Channels whose platform
+  // supports it (Slack chat.update, Telegram editMessageText, Discord followup
+  // edit) implement it; channels without an edit primitive (Gmail, WhatsApp
+  // Business) omit it and the orchestrator falls back to append-on-stage.
+  updateMessage?(
+    jid: string,
+    handle: MessageHandle,
+    newText: string,
   ): Promise<void>;
+}
+
+// --- Progress lifecycle event schema ---
+
+// Producer lifecycle kinds. 'failed' is producer-known failure (terminal);
+// orchestrator-detected stalls reuse the FailureKind 'stalled' kind in
+// src/router.ts, not a progress kind.
+export type ProgressKind = 'started' | 'tick' | 'stage' | 'done' | 'failed';
+
+// Generic across video providers — no Veo / Omni / Sora-specific fields.
+// The schema lives next to the helper at container/lib/progress.py.
+export interface ProgressEvent {
+  request_id: string;
+  // The chat the producer is rendering for. Set by the helper from
+  // NANOCLAW_CHAT_JID so the orchestrator can route the 'started' event
+  // before an anchor row exists in progress_anchors.
+  chat_jid: string;
+  kind: ProgressKind;
+  stage: string;
+  elapsed_sec: number;
+  eta_sec?: number;
+  percent?: number;
+  next_stage?: string;
+  model_id?: string;
+  // Only present on kind='done'. Workspace-relative path the agent's
+  // send_video MCP call would also accept.
+  media_path?: string;
+  // Only present on kind='failed'. Producer-known reason (e.g., "quota").
+  reason?: string;
+  // ISO-8601 monotonic per-request; the consumer uses this for event-sequence
+  // dedup so a 1s IPC poll re-reading the persistent file doesn't re-dispatch
+  // the same update every tick.
+  emitted_at: string;
 }
 
 // Callback type that channels use to deliver inbound messages

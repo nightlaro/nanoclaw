@@ -18,6 +18,7 @@ import {
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
+  MessageHandle,
   OnInboundMessage,
   OnChatMetadata,
   RegisteredGroup,
@@ -399,7 +400,10 @@ export class SlackChannel implements Channel {
     await this.syncChannelMetadata();
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(
+    jid: string,
+    text: string,
+  ): Promise<MessageHandle | undefined> {
     const channelId = jid.replace(/^slack:/, '');
 
     if (!this.connected) {
@@ -408,28 +412,40 @@ export class SlackChannel implements Channel {
         { jid, queueSize: this.outgoingQueue.length },
         'Slack disconnected, message queued',
       );
-      return;
+      return undefined;
     }
 
     try {
-      // Slack limits messages to ~4000 characters; split if needed
+      // Slack limits messages to ~4000 characters; split if needed.
+      // When splitting, the first chunk's ts is the canonical anchor handle —
+      // the progress layer edits that one; subsequent chunks are not anchored.
+      let firstTs: string | undefined;
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
+        const res = await this.app.client.chat.postMessage({
+          channel: channelId,
+          text,
+        });
+        firstTs = (res as { ts?: string } | undefined)?.ts;
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
-          await this.app.client.chat.postMessage({
+          const res = await this.app.client.chat.postMessage({
             channel: channelId,
             text: text.slice(i, i + MAX_MESSAGE_LENGTH),
           });
+          if (firstTs === undefined) {
+            firstTs = (res as { ts?: string } | undefined)?.ts;
+          }
         }
       }
       logger.info({ jid, length: text.length }, 'Slack message sent');
+      return firstTs ? `${channelId}:${firstTs}` : undefined;
     } catch (err) {
       this.outgoingQueue.push({ kind: 'text', jid, text });
       logger.warn(
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send Slack message, queued',
       );
+      return undefined;
     }
   }
 
@@ -437,7 +453,7 @@ export class SlackChannel implements Channel {
     jid: string,
     imagePaths: string[],
     caption?: string,
-  ): Promise<void> {
+  ): Promise<MessageHandle | undefined> {
     const channelId = jid.replace(/^slack:/, '');
     if (!this.connected) {
       this.outgoingQueue.push({ kind: 'image', jid, imagePaths, caption });
@@ -445,7 +461,7 @@ export class SlackChannel implements Channel {
         { jid, count: imagePaths.length, queueSize: this.outgoingQueue.length },
         'Slack disconnected, image queued',
       );
-      return;
+      return undefined;
     }
     try {
       await this.app.client.files.uploadV2({
@@ -464,13 +480,17 @@ export class SlackChannel implements Channel {
         'Failed to send Slack image, queued',
       );
     }
+    // files.uploadV2 does not return a single anchorable ts (uploads land via
+    // a separate share). The progress layer falls through to append-on-stage
+    // for media delivery; only text anchors are edit-in-place.
+    return undefined;
   }
 
   async sendVideo(
     jid: string,
     videoPaths: string[],
     caption?: string,
-  ): Promise<void> {
+  ): Promise<MessageHandle | undefined> {
     const channelId = jid.replace(/^slack:/, '');
     if (!this.connected) {
       this.outgoingQueue.push({ kind: 'video', jid, videoPaths, caption });
@@ -478,7 +498,7 @@ export class SlackChannel implements Channel {
         { jid, count: videoPaths.length, queueSize: this.outgoingQueue.length },
         'Slack disconnected, video queued',
       );
-      return;
+      return undefined;
     }
     // files.uploadV2 auto-detects video mime types from filename; the same
     // call shape works for both images and videos.
@@ -499,6 +519,8 @@ export class SlackChannel implements Channel {
         'Failed to send Slack video, queued',
       );
     }
+    // See sendImage for why uploadV2 doesn't yield a single ts anchor.
+    return undefined;
   }
 
   isConnected(): boolean {

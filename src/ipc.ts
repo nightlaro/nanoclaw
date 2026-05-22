@@ -8,10 +8,16 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { MessageHandle, RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string) => Promise<void>;
+  // Widened return type lets the progress consumer (U6) capture the anchor
+  // MessageHandle when sending the initial 'started' event. Callers that
+  // don't need the handle simply discard the return.
+  sendMessage: (
+    jid: string,
+    text: string,
+  ) => Promise<MessageHandle | undefined>;
   sendImage: (jid: string, paths: string[], caption?: string) => Promise<void>;
   sendVideo: (jid: string, paths: string[], caption?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;

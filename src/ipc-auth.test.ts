@@ -52,7 +52,7 @@ beforeEach(() => {
   setRegisteredGroup('third@g.us', THIRD_GROUP);
 
   deps = {
-    sendMessage: async () => {},
+    sendMessage: async () => undefined,
     sendImage: async () => {},
     sendVideo: async () => {},
     registeredGroups: () => groups,

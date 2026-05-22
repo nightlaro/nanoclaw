@@ -70,7 +70,12 @@ import {
 } from './sender-allowlist.js';
 import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import {
+  Channel,
+  MessageHandle,
+  NewMessage,
+  RegisteredGroup,
+} from './types.js';
 import type { ImageAttachment } from './types.js';
 import { logger } from './logger.js';
 
@@ -95,7 +100,7 @@ const DEDUP_WINDOW_MS = 5000;
 function deduplicatedSend(
   jid: string,
   text: string,
-): Promise<void> | undefined {
+): Promise<MessageHandle | undefined> | undefined {
   const key = `${jid}:${text.slice(0, 200)}`;
   const now = Date.now();
   const lastSent = recentSends.get(key);
@@ -797,7 +802,7 @@ async function main(): Promise<void> {
   });
   startIpcWatcher({
     sendMessage: (jid, text) => {
-      return deduplicatedSend(jid, text) ?? Promise.resolve();
+      return deduplicatedSend(jid, text) ?? Promise.resolve(undefined);
     },
     sendImage: (jid, paths, caption) =>
       routeOutboundImage(channels, jid, paths, caption),

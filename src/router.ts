@@ -41,14 +41,17 @@ export function formatOutbound(rawText: string): string {
   return text;
 }
 
-export function routeOutbound(
+export async function routeOutbound(
   channels: Channel[],
   jid: string,
   text: string,
 ): Promise<void> {
   const channel = channels.find((c) => c.ownsJid(jid) && c.isConnected());
   if (!channel) throw new Error(`No channel for JID: ${jid}`);
-  return channel.sendMessage(jid, text);
+  // Discard any MessageHandle returned. Callers that need the handle (e.g.
+  // the progress consumer at the 'started' event) call channel.sendMessage
+  // directly via findChannel rather than routing through this helper.
+  await channel.sendMessage(jid, text);
 }
 
 export async function routeOutboundImage(
