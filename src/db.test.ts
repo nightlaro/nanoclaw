@@ -3,17 +3,23 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   _initTestDatabase,
   createTask,
+  deleteAnchor,
   deleteTask,
+  getActiveAnchorsStaleBefore,
   getAllChats,
   getAllRegisteredGroups,
   getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
+  getProgressAnchor,
   getTaskById,
+  markAnchorTerminal,
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
+  updateAnchorLastProcessed,
   updateTask,
+  upsertProgressAnchor,
 } from './db.js';
 import { formatMessages } from './router.js';
 
@@ -648,5 +654,132 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+// --- progress_anchors ---
+
+describe('progress anchors', () => {
+  const ANCHOR = {
+    request_id: 'req-abc-1',
+    chat_jid: 'slack:C1',
+    channel: 'slack',
+    handle: 'C1:1700000000.000001',
+    last_stage: 'queued',
+    model_id: 'veo-3.1',
+    created_at: '2026-05-21T00:00:00.000Z',
+    last_update_at: '2026-05-21T00:00:00.000Z',
+  };
+
+  it('round-trips a fresh anchor with all fields and null terminal_state', () => {
+    upsertProgressAnchor(ANCHOR);
+
+    const row = getProgressAnchor(ANCHOR.request_id);
+    expect(row).toBeDefined();
+    expect(row!.request_id).toBe('req-abc-1');
+    expect(row!.chat_jid).toBe('slack:C1');
+    expect(row!.channel).toBe('slack');
+    expect(row!.handle).toBe('C1:1700000000.000001');
+    expect(row!.last_stage).toBe('queued');
+    expect(row!.model_id).toBe('veo-3.1');
+    expect(row!.created_at).toBe('2026-05-21T00:00:00.000Z');
+    expect(row!.last_update_at).toBe('2026-05-21T00:00:00.000Z');
+    expect(row!.terminal_state).toBeNull();
+    expect(row!.last_processed_emitted_at).toBeNull();
+  });
+
+  it('upserts on same request_id and overwrites stage + last_update_at', () => {
+    upsertProgressAnchor(ANCHOR);
+    upsertProgressAnchor({
+      ...ANCHOR,
+      last_stage: 'rendering',
+      last_update_at: '2026-05-21T00:00:10.000Z',
+    });
+
+    const row = getProgressAnchor(ANCHOR.request_id);
+    expect(row!.last_stage).toBe('rendering');
+    expect(row!.last_update_at).toBe('2026-05-21T00:00:10.000Z');
+  });
+
+  it('markAnchorTerminal sets terminal_state and optional last_stage', () => {
+    upsertProgressAnchor(ANCHOR);
+    markAnchorTerminal('req-abc-1', 'completed', 'uploading');
+
+    const row = getProgressAnchor('req-abc-1');
+    expect(row!.terminal_state).toBe('completed');
+    expect(row!.last_stage).toBe('uploading');
+    // last_update_at should be bumped to reflect when the terminal happened
+    expect(row!.last_update_at).not.toBe('2026-05-21T00:00:00.000Z');
+  });
+
+  it('markAnchorTerminal preserves last_stage when not provided', () => {
+    upsertProgressAnchor({ ...ANCHOR, last_stage: 'rendering' });
+    markAnchorTerminal('req-abc-1', 'failed');
+
+    const row = getProgressAnchor('req-abc-1');
+    expect(row!.terminal_state).toBe('failed');
+    expect(row!.last_stage).toBe('rendering');
+  });
+
+  it('getActiveAnchorsStaleBefore returns only in-flight anchors past threshold', () => {
+    upsertProgressAnchor({
+      ...ANCHOR,
+      request_id: 'fresh',
+      last_update_at: '2026-05-21T00:00:30.000Z',
+    });
+    upsertProgressAnchor({
+      ...ANCHOR,
+      request_id: 'stale-active',
+      last_update_at: '2026-05-21T00:00:00.000Z',
+    });
+    upsertProgressAnchor({
+      ...ANCHOR,
+      request_id: 'stale-terminal',
+      last_update_at: '2026-05-21T00:00:00.000Z',
+    });
+    markAnchorTerminal('stale-terminal', 'completed');
+
+    const stale = getActiveAnchorsStaleBefore('2026-05-21T00:00:10.000Z');
+
+    expect(stale.map((r) => r.request_id)).toEqual(['stale-active']);
+  });
+
+  it('getActiveAnchorsStaleBefore uses strict < comparison at the boundary', () => {
+    upsertProgressAnchor({
+      ...ANCHOR,
+      request_id: 'at-boundary',
+      last_update_at: '2026-05-21T00:00:00.000Z',
+    });
+
+    const equal = getActiveAnchorsStaleBefore('2026-05-21T00:00:00.000Z');
+    expect(equal).toHaveLength(0);
+
+    const past = getActiveAnchorsStaleBefore('2026-05-21T00:00:00.001Z');
+    expect(past).toHaveLength(1);
+  });
+
+  it('deleteAnchor removes the row', () => {
+    upsertProgressAnchor(ANCHOR);
+    expect(getProgressAnchor('req-abc-1')).toBeDefined();
+
+    deleteAnchor('req-abc-1');
+    expect(getProgressAnchor('req-abc-1')).toBeUndefined();
+  });
+
+  it('updateAnchorLastProcessed advances dedup cursor + last_update_at', () => {
+    upsertProgressAnchor(ANCHOR);
+    updateAnchorLastProcessed(
+      'req-abc-1',
+      '2026-05-21T00:00:05.000Z',
+      '2026-05-21T00:00:05.500Z',
+    );
+
+    const row = getProgressAnchor('req-abc-1');
+    expect(row!.last_processed_emitted_at).toBe('2026-05-21T00:00:05.000Z');
+    expect(row!.last_update_at).toBe('2026-05-21T00:00:05.500Z');
+  });
+
+  it('getProgressAnchor returns undefined for unknown request_id', () => {
+    expect(getProgressAnchor('does-not-exist')).toBeUndefined();
   });
 });

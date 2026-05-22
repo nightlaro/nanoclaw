@@ -82,6 +82,27 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    -- Per-request anchor for the video-progress feedback layer.
+    -- One row per in-flight producer request; terminal_state is NULL until
+    -- the watchdog (U8) or the producer's terminal event fires. Persisted so
+    -- an orchestrator restart mid-render still resolves edits to the right
+    -- message (R16). last_processed_emitted_at gates consumer-side dedup so
+    -- the 1s IPC poll re-reading the persistent file doesn't re-fire updates.
+    CREATE TABLE IF NOT EXISTS progress_anchors (
+      request_id TEXT PRIMARY KEY,
+      chat_jid TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      handle TEXT NOT NULL,
+      last_stage TEXT,
+      model_id TEXT,
+      created_at TEXT NOT NULL,
+      last_update_at TEXT NOT NULL,
+      last_processed_emitted_at TEXT,
+      terminal_state TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_progress_anchors_active
+      ON progress_anchors(terminal_state, last_update_at);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -687,6 +708,125 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Progress anchor accessors (video-progress feedback layer) ---
+
+export interface ProgressAnchor {
+  request_id: string;
+  chat_jid: string;
+  channel: string;
+  handle: string;
+  last_stage: string | null;
+  model_id: string | null;
+  created_at: string;
+  last_update_at: string;
+  last_processed_emitted_at: string | null;
+  terminal_state: 'completed' | 'failed' | 'stalled' | 'anchor_lost' | null;
+}
+
+export interface ProgressAnchorInput {
+  request_id: string;
+  chat_jid: string;
+  channel: string;
+  handle: string;
+  last_stage?: string | null;
+  model_id?: string | null;
+  created_at: string;
+  last_update_at: string;
+}
+
+export function upsertProgressAnchor(row: ProgressAnchorInput): void {
+  // INSERT OR REPLACE preserves the PRIMARY KEY contract; on conflict the
+  // existing row's terminal_state and last_processed_emitted_at are reset.
+  // Callers reading mid-lifecycle should use updateAnchorLastProcessed or
+  // markAnchorTerminal to advance just those fields without rebuilding the
+  // whole row.
+  db.prepare(
+    `INSERT OR REPLACE INTO progress_anchors
+       (request_id, chat_jid, channel, handle, last_stage, model_id, created_at, last_update_at, last_processed_emitted_at, terminal_state)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+  ).run(
+    row.request_id,
+    row.chat_jid,
+    row.channel,
+    row.handle,
+    row.last_stage ?? null,
+    row.model_id ?? null,
+    row.created_at,
+    row.last_update_at,
+  );
+}
+
+export function getProgressAnchor(
+  requestId: string,
+): ProgressAnchor | undefined {
+  const row = db
+    .prepare('SELECT * FROM progress_anchors WHERE request_id = ?')
+    .get(requestId) as ProgressAnchor | undefined;
+  return row;
+}
+
+export function getActiveAnchorsStaleBefore(
+  thresholdIso: string,
+): ProgressAnchor[] {
+  // Strict < comparison: an anchor whose last_update_at exactly matches the
+  // threshold is not considered stale yet. The watchdog asks "older than".
+  return db
+    .prepare(
+      `SELECT * FROM progress_anchors
+       WHERE terminal_state IS NULL AND last_update_at < ?
+       ORDER BY last_update_at`,
+    )
+    .all(thresholdIso) as ProgressAnchor[];
+}
+
+export function markAnchorTerminal(
+  requestId: string,
+  terminalState: 'completed' | 'failed' | 'stalled' | 'anchor_lost',
+  lastStage?: string,
+): void {
+  const now = new Date().toISOString();
+  if (lastStage !== undefined) {
+    db.prepare(
+      `UPDATE progress_anchors
+         SET terminal_state = ?, last_stage = ?, last_update_at = ?
+       WHERE request_id = ?`,
+    ).run(terminalState, lastStage, now, requestId);
+  } else {
+    db.prepare(
+      `UPDATE progress_anchors
+         SET terminal_state = ?, last_update_at = ?
+       WHERE request_id = ?`,
+    ).run(terminalState, now, requestId);
+  }
+}
+
+export function deleteAnchor(requestId: string): void {
+  db.prepare('DELETE FROM progress_anchors WHERE request_id = ?').run(
+    requestId,
+  );
+}
+
+export function updateAnchorLastProcessed(
+  requestId: string,
+  emittedAt: string,
+  lastUpdateAt: string,
+  lastStage?: string,
+): void {
+  if (lastStage !== undefined) {
+    db.prepare(
+      `UPDATE progress_anchors
+         SET last_processed_emitted_at = ?, last_update_at = ?, last_stage = ?
+       WHERE request_id = ?`,
+    ).run(emittedAt, lastUpdateAt, lastStage, requestId);
+  } else {
+    db.prepare(
+      `UPDATE progress_anchors
+         SET last_processed_emitted_at = ?, last_update_at = ?
+       WHERE request_id = ?`,
+    ).run(emittedAt, lastUpdateAt, requestId);
+  }
 }
 
 // --- JSON migration ---
