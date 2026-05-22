@@ -55,6 +55,12 @@ COPY agent-runner/ ./
 # Build TypeScript
 RUN npm run build
 
+# Shared Python library mounted into the image so any producer script can do
+# `from progress import progress` without sys.path manipulation. First entry
+# in container/lib/; future shared container Python libs land here too.
+COPY lib/ /app/lib/
+ENV PYTHONPATH=/app/lib
+
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
