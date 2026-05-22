@@ -607,9 +607,20 @@ async function main(): Promise<void> {
 
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
   // No real secrets exist in the container environment.
+  //
+  // NANOCLAW_CHAT_JID / NANOCLAW_GROUP_FOLDER / NANOCLAW_IS_MAIN are also
+  // wired into the nanoclaw MCP server below, but they need to live on the
+  // SDK process env too: Bash tool invocations (e.g. `uv run generate_video.py`
+  // for the video-progress helper at container/lib/progress.py) inherit the
+  // SDK process env, not the MCP server's. Without this propagation the
+  // producer's `progress(...)` call falls back to `os.environ["NANOCLAW_CHAT_JID"]`
+  // and raises.
   const sdkEnv: Record<string, string | undefined> = {
     ...process.env,
     CLAUDE_CODE_AUTO_COMPACT_WINDOW: '200000',
+    NANOCLAW_CHAT_JID: containerInput.chatJid,
+    NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+    NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
   };
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
