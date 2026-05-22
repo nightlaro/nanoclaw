@@ -16,6 +16,7 @@ import {
   materializeAttachment,
 } from '../media.js';
 import { registerChannel, ChannelOpts } from './registry.js';
+import { formatOutbound } from '../router.js';
 import {
   Channel,
   MessageHandle,
@@ -29,6 +30,21 @@ import {
 // Slack's chat.postMessage API limits text to ~4000 characters per call.
 // Messages exceeding this are split into sequential chunks.
 const MAX_MESSAGE_LENGTH = 4000;
+
+// Slack Web API errors surface as `Error` with the API code on `.data.error`.
+// We extract defensively so a shape change doesn't trap the updateMessage
+// caller (which relies on no-throw semantics).
+function extractSlackErrorCode(err: unknown): string | undefined {
+  if (err && typeof err === 'object' && 'data' in err) {
+    const data = (err as { data?: unknown }).data;
+    if (data && typeof data === 'object' && 'error' in data) {
+      const code = (data as { error?: unknown }).error;
+      if (typeof code === 'string') return code;
+    }
+  }
+  if (err instanceof Error) return err.message;
+  return undefined;
+}
 
 // Human-friendly byte size for the inbox marker block. Two-decimal precision
 // keeps small files distinguishable (8.2 KB vs 8.5 KB) without overstating
@@ -56,21 +72,36 @@ export class SlackChannel implements Channel {
   private app: App;
   private botUserId: string | undefined;
   private connected = false;
+  // Discriminated union — the exhaustiveness check in flushOutgoingQueue
+  // catches new kinds at compile time before they can silently misroute.
   private outgoingQueue: Array<
-    | { kind: 'text'; jid: string; text: string }
+    | { kind: 'text'; jid: string; text: string; enqueuedAt: number }
     | {
         kind: 'image';
         jid: string;
         imagePaths: string[];
         caption?: string;
+        enqueuedAt: number;
       }
     | {
         kind: 'video';
         jid: string;
         videoPaths: string[];
         caption?: string;
+        enqueuedAt: number;
+      }
+    | {
+        kind: 'update';
+        jid: string;
+        handle: MessageHandle;
+        text: string;
+        enqueuedAt: number;
       }
   > = [];
+  // Anchor-update flushes drop entries older than this — past the grace
+  // window the watchdog will fire `routeFailureNotice(..., 'stalled')`
+  // anyway, so re-edits of long-stale anchors only add noise.
+  private static readonly UPDATE_QUEUE_GRACE_MS = 30_000;
   private flushing = false;
   private userNameCache = new Map<string, string>();
   private botToken: string;
@@ -407,7 +438,12 @@ export class SlackChannel implements Channel {
     const channelId = jid.replace(/^slack:/, '');
 
     if (!this.connected) {
-      this.outgoingQueue.push({ kind: 'text', jid, text });
+      this.outgoingQueue.push({
+        kind: 'text',
+        jid,
+        text,
+        enqueuedAt: Date.now(),
+      });
       logger.info(
         { jid, queueSize: this.outgoingQueue.length },
         'Slack disconnected, message queued',
@@ -440,7 +476,12 @@ export class SlackChannel implements Channel {
       logger.info({ jid, length: text.length }, 'Slack message sent');
       return firstTs ? `${channelId}:${firstTs}` : undefined;
     } catch (err) {
-      this.outgoingQueue.push({ kind: 'text', jid, text });
+      this.outgoingQueue.push({
+        kind: 'text',
+        jid,
+        text,
+        enqueuedAt: Date.now(),
+      });
       logger.warn(
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send Slack message, queued',
@@ -456,7 +497,13 @@ export class SlackChannel implements Channel {
   ): Promise<MessageHandle | undefined> {
     const channelId = jid.replace(/^slack:/, '');
     if (!this.connected) {
-      this.outgoingQueue.push({ kind: 'image', jid, imagePaths, caption });
+      this.outgoingQueue.push({
+        kind: 'image',
+        jid,
+        imagePaths,
+        caption,
+        enqueuedAt: Date.now(),
+      });
       logger.info(
         { jid, count: imagePaths.length, queueSize: this.outgoingQueue.length },
         'Slack disconnected, image queued',
@@ -474,7 +521,13 @@ export class SlackChannel implements Channel {
       });
       logger.info({ jid, count: imagePaths.length }, 'Slack image(s) sent');
     } catch (err) {
-      this.outgoingQueue.push({ kind: 'image', jid, imagePaths, caption });
+      this.outgoingQueue.push({
+        kind: 'image',
+        jid,
+        imagePaths,
+        caption,
+        enqueuedAt: Date.now(),
+      });
       logger.warn(
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send Slack image, queued',
@@ -493,7 +546,13 @@ export class SlackChannel implements Channel {
   ): Promise<MessageHandle | undefined> {
     const channelId = jid.replace(/^slack:/, '');
     if (!this.connected) {
-      this.outgoingQueue.push({ kind: 'video', jid, videoPaths, caption });
+      this.outgoingQueue.push({
+        kind: 'video',
+        jid,
+        videoPaths,
+        caption,
+        enqueuedAt: Date.now(),
+      });
       logger.info(
         { jid, count: videoPaths.length, queueSize: this.outgoingQueue.length },
         'Slack disconnected, video queued',
@@ -513,7 +572,13 @@ export class SlackChannel implements Channel {
       });
       logger.info({ jid, count: videoPaths.length }, 'Slack video(s) sent');
     } catch (err) {
-      this.outgoingQueue.push({ kind: 'video', jid, videoPaths, caption });
+      this.outgoingQueue.push({
+        kind: 'video',
+        jid,
+        videoPaths,
+        caption,
+        enqueuedAt: Date.now(),
+      });
       logger.warn(
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send Slack video, queued',
@@ -521,6 +586,87 @@ export class SlackChannel implements Channel {
     }
     // See sendImage for why uploadV2 doesn't yield a single ts anchor.
     return undefined;
+  }
+
+  async updateMessage(
+    jid: string,
+    handle: MessageHandle,
+    newText: string,
+  ): Promise<void> {
+    // Defensive parse — the handle string round-trips through orchestrator
+    // SQLite and back. A malformed handle means a code change broke the
+    // encoding contract; log and no-op so the consumer isn't trapped.
+    const sepIdx = handle.indexOf(':');
+    if (sepIdx <= 0 || sepIdx === handle.length - 1) {
+      logger.warn(
+        { jid, handle },
+        'Slack updateMessage: malformed handle, no-op',
+      );
+      return;
+    }
+    const channelId = handle.slice(0, sepIdx);
+    const ts = handle.slice(sepIdx + 1);
+
+    if (!this.connected) {
+      this.enqueueUpdate(jid, handle, newText);
+      logger.info(
+        { jid, handle, queueSize: this.outgoingQueue.length },
+        'Slack disconnected, anchor update queued',
+      );
+      return;
+    }
+
+    const text = formatOutbound(newText);
+    try {
+      await this.app.client.chat.update({ channel: channelId, ts, text });
+      logger.info({ jid, handle, length: text.length }, 'Slack anchor edited');
+    } catch (err) {
+      // Slack-specific error codes that mean the anchor message is gone.
+      // Treat as silent no-op: posting a fresh anchor mid-render would
+      // create an orphaned "in-progress" view; the orchestrator's watchdog
+      // (U8) eventually fires `routeFailureNotice(..., 'stalled')` if
+      // updates stop landing, which is the right user-facing recovery.
+      const code = extractSlackErrorCode(err);
+      if (
+        code === 'message_not_found' ||
+        code === 'not_in_channel' ||
+        code === 'channel_not_found'
+      ) {
+        logger.warn(
+          { jid, handle, code },
+          'Slack updateMessage: anchor lost, no-op',
+        );
+        return;
+      }
+      logger.warn({ jid, handle, err }, 'Slack updateMessage failed');
+    }
+  }
+
+  private enqueueUpdate(
+    jid: string,
+    handle: MessageHandle,
+    text: string,
+  ): void {
+    // Collapse latest-wins for the same handle so a backlog of updates
+    // doesn't replay stale stage transitions when the channel reconnects.
+    const existingIdx = this.outgoingQueue.findIndex(
+      (e) => e.kind === 'update' && e.jid === jid && e.handle === handle,
+    );
+    if (existingIdx >= 0) {
+      const existing = this.outgoingQueue[existingIdx];
+      if (existing.kind === 'update') {
+        existing.text = text;
+        existing.enqueuedAt = Date.now();
+        return;
+      }
+    }
+    this.outgoingQueue.push({
+      kind: 'update',
+      jid,
+      handle,
+      text,
+      enqueuedAt: Date.now(),
+    });
   }
 
   isConnected(): boolean {
@@ -602,6 +748,7 @@ export class SlackChannel implements Channel {
         { count: this.outgoingQueue.length },
         'Flushing Slack outgoing queue',
       );
+      const now = Date.now();
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
         const channelId = item.jid.replace(/^slack:/, '');
@@ -640,6 +787,55 @@ export class SlackChannel implements Channel {
             { jid: item.jid, count: item.videoPaths.length },
             'Queued Slack video(s) sent',
           );
+        } else if (item.kind === 'update') {
+          // Drop edits past the grace window — past 30s the watchdog will
+          // overwrite the anchor with a stalled notice, so re-edits of
+          // a long-stale anchor only add noise.
+          if (now - item.enqueuedAt > SlackChannel.UPDATE_QUEUE_GRACE_MS) {
+            logger.info(
+              { jid: item.jid, handle: item.handle, ageMs: now - item.enqueuedAt },
+              'Dropping queued Slack anchor update past grace window',
+            );
+            continue;
+          }
+          const sepIdx = item.handle.indexOf(':');
+          if (sepIdx <= 0 || sepIdx === item.handle.length - 1) {
+            logger.warn(
+              { jid: item.jid, handle: item.handle },
+              'Dropping queued update with malformed handle',
+            );
+            continue;
+          }
+          const updateChannel = item.handle.slice(0, sepIdx);
+          const ts = item.handle.slice(sepIdx + 1);
+          try {
+            await this.app.client.chat.update({
+              channel: updateChannel,
+              ts,
+              text: formatOutbound(item.text),
+            });
+            logger.info(
+              { jid: item.jid, handle: item.handle },
+              'Queued Slack anchor update sent',
+            );
+          } catch (err) {
+            const code = extractSlackErrorCode(err);
+            if (
+              code === 'message_not_found' ||
+              code === 'not_in_channel' ||
+              code === 'channel_not_found'
+            ) {
+              logger.warn(
+                { jid: item.jid, handle: item.handle, code },
+                'Queued Slack anchor update: anchor lost, dropped',
+              );
+              continue;
+            }
+            logger.warn(
+              { jid: item.jid, handle: item.handle, err },
+              'Queued Slack anchor update failed, dropped',
+            );
+          }
         } else {
           // Exhaustiveness check — adding a new kind to outgoingQueue will trip
           // this at compile time before it can silently misroute at runtime.

@@ -115,6 +115,7 @@ vi.mock('@slack/bolt', () => ({
       },
       chat: {
         postMessage: vi.fn().mockResolvedValue(undefined),
+        update: vi.fn().mockResolvedValue({ ok: true }),
       },
       conversations: {
         list: vi.fn().mockResolvedValue({
@@ -1661,6 +1662,222 @@ describe('SlackChannel', () => {
       await expect(
         channel.sendVideo!('slack:C0123456789', ['/abs/clip.mp4']),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  // --- sendMessage handle return (U1 / U7) ---
+
+  describe('sendMessage handle return', () => {
+    it('returns encoded handle "<channelId>:<ts>" on successful post', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.chat.postMessage.mockResolvedValueOnce({
+        ok: true,
+        ts: '1700000000.000001',
+      });
+
+      const handle = await channel.sendMessage('slack:C0123456789', 'Hello');
+      expect(handle).toBe('C0123456789:1700000000.000001');
+    });
+
+    it('returns undefined when post fails (queued for retry)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.chat.postMessage.mockRejectedValueOnce(
+        new Error('postMessage_failed'),
+      );
+
+      const handle = await channel.sendMessage('slack:C0123456789', 'Hello');
+      expect(handle).toBeUndefined();
+    });
+
+    it('returns the FIRST chunk handle when splitting long messages', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp()
+        .client.chat.postMessage.mockResolvedValueOnce({
+          ok: true,
+          ts: '1700000000.000001',
+        })
+        .mockResolvedValueOnce({ ok: true, ts: '1700000000.000002' });
+
+      const handle = await channel.sendMessage(
+        'slack:C0123456789',
+        'A'.repeat(4500),
+      );
+      expect(handle).toBe('C0123456789:1700000000.000001');
+    });
+  });
+
+  // --- updateMessage (U7) ---
+
+  describe('updateMessage', () => {
+    it('invokes chat.update with parsed channelId + ts', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.updateMessage!(
+        'slack:C0123456789',
+        'C0123456789:1700000000.000001',
+        'updated text',
+      );
+
+      expect(currentApp().client.chat.update).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        ts: '1700000000.000001',
+        text: 'updated text',
+      });
+    });
+
+    it('strips <internal> tags via formatOutbound before editing', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.updateMessage!(
+        'slack:C0123456789',
+        'C0123456789:1700000000.000001',
+        'user text\n<internal>scratch</internal>\nmore',
+      );
+
+      const call = currentApp().client.chat.update.mock.calls[0][0];
+      expect(call.text).not.toContain('<internal>');
+      expect(call.text).not.toContain('scratch');
+      expect(call.text).toContain('user text');
+      expect(call.text).toContain('more');
+    });
+
+    it('no-ops on malformed handle (does not throw, does not call chat.update)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await expect(
+        channel.updateMessage!(
+          'slack:C0123456789',
+          'garbage-handle-no-colon',
+          'updated text',
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(currentApp().client.chat.update).not.toHaveBeenCalled();
+    });
+
+    it('treats anchor-lost error codes as silent no-op', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      for (const code of [
+        'message_not_found',
+        'not_in_channel',
+        'channel_not_found',
+      ]) {
+        currentApp().client.chat.update.mockRejectedValueOnce(
+          Object.assign(new Error(code), { data: { error: code } }),
+        );
+
+        await expect(
+          channel.updateMessage!(
+            'slack:C0123456789',
+            'C0123456789:1700000000.000001',
+            'updated',
+          ),
+        ).resolves.toBeUndefined();
+      }
+    });
+
+    it('does not throw on generic update error (logged + swallowed)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.chat.update.mockRejectedValueOnce(
+        new Error('some_other_error'),
+      );
+
+      await expect(
+        channel.updateMessage!(
+          'slack:C0123456789',
+          'C0123456789:1700000000.000001',
+          'updated',
+        ),
+      ).resolves.toBeUndefined();
+    });
+
+    it('queues update while disconnected and flushes on connect', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      // Not connected yet
+      await channel.updateMessage!(
+        'slack:C0123456789',
+        'C0123456789:1700000000.000001',
+        'queued update',
+      );
+      expect(currentApp().client.chat.update).not.toHaveBeenCalled();
+
+      await channel.connect();
+
+      expect(currentApp().client.chat.update).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        ts: '1700000000.000001',
+        text: 'queued update',
+      });
+    });
+
+    it('collapses queued updates to same handle to latest-wins', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.updateMessage!(
+        'slack:C0123456789',
+        'C0123456789:1700000000.000001',
+        'first',
+      );
+      await channel.updateMessage!(
+        'slack:C0123456789',
+        'C0123456789:1700000000.000001',
+        'second',
+      );
+      await channel.updateMessage!(
+        'slack:C0123456789',
+        'C0123456789:1700000000.000001',
+        'latest',
+      );
+
+      await channel.connect();
+
+      expect(currentApp().client.chat.update).toHaveBeenCalledTimes(1);
+      expect(currentApp().client.chat.update).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        ts: '1700000000.000001',
+        text: 'latest',
+      });
+    });
+
+    it('keeps queued updates to different handles distinct', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.updateMessage!(
+        'slack:C0123456789',
+        'C0123456789:1700000000.000001',
+        'msg1 update',
+      );
+      await channel.updateMessage!(
+        'slack:C0123456789',
+        'C0123456789:1700000000.000002',
+        'msg2 update',
+      );
+
+      await channel.connect();
+
+      expect(currentApp().client.chat.update).toHaveBeenCalledTimes(2);
     });
   });
 });
