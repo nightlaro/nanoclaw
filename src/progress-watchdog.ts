@@ -118,10 +118,7 @@ export function startProgressWatchdog(
     });
   }, tickMs);
 
-  logger.info(
-    { tickMs, thresholdMs },
-    'Progress watchdog started',
-  );
+  logger.info({ tickMs, thresholdMs }, 'Progress watchdog started');
 }
 
 export function stopProgressWatchdog(): void {

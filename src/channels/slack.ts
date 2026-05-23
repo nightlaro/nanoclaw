@@ -793,7 +793,11 @@ export class SlackChannel implements Channel {
           // a long-stale anchor only add noise.
           if (now - item.enqueuedAt > SlackChannel.UPDATE_QUEUE_GRACE_MS) {
             logger.info(
-              { jid: item.jid, handle: item.handle, ageMs: now - item.enqueuedAt },
+              {
+                jid: item.jid,
+                handle: item.handle,
+                ageMs: now - item.enqueuedAt,
+              },
               'Dropping queued Slack anchor update past grace window',
             );
             continue;

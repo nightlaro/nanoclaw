@@ -561,7 +561,11 @@ describe('processProgressIpcFile', () => {
       expect.objectContaining({ kind: 'done' }),
       'C1:1.0',
     );
-    expect(markTerminal).toHaveBeenCalledWith('req-1', 'completed', 'uploading');
+    expect(markTerminal).toHaveBeenCalledWith(
+      'req-1',
+      'completed',
+      'uploading',
+    );
     expect(result.shouldUnlink).toBe(true);
   });
 
@@ -588,9 +592,7 @@ describe('processProgressIpcFile', () => {
   });
 
   it('stale leftover: anchor already terminal, file should be unlinked silently', async () => {
-    getAnchor.mockReturnValueOnce(
-      anchorRow({ terminal_state: 'completed' }),
-    );
+    getAnchor.mockReturnValueOnce(anchorRow({ terminal_state: 'completed' }));
 
     const result = await processProgressIpcFile(
       ev({ kind: 'started' }),

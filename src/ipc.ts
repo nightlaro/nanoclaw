@@ -8,11 +8,7 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import {
-  MessageHandle,
-  ProgressEvent,
-  RegisteredGroup,
-} from './types.js';
+import { MessageHandle, ProgressEvent, RegisteredGroup } from './types.js';
 import {
   deleteAnchor,
   getProgressAnchor,
@@ -828,11 +824,7 @@ export async function processProgressIpcFile(
   // No anchor yet → first time we see this request. Post the initial
   // anchor, capture the handle, and persist the row.
   if (!anchor) {
-    const handle = await routeProgressNotice(
-      data.chat_jid,
-      data,
-      undefined,
-    );
+    const handle = await routeProgressNotice(data.chat_jid, data, undefined);
 
     if (handle !== undefined) {
       accessors.upsertAnchor({
